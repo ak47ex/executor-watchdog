@@ -121,7 +121,9 @@ open class ExecutorServiceWatchdog(
 
     protected fun rememberTask(task: WatchdogTask = createTask()): Long {
         val num = taskNumber.getAndIncrement()
-        tasks[num] = task.copy(startTime = time())
+        lock.withLock {
+            tasks[num] = task.copy(startTime = time())
+        }
         return num
     }
 
@@ -139,8 +141,8 @@ open class ExecutorServiceWatchdog(
     }
 
     protected fun completeTask(task: Long) {
-        tasks.remove(task)
         lock.withLock {
+            tasks.remove(task)
             condition.signal()
         }
     }
@@ -158,38 +160,58 @@ open class ExecutorServiceWatchdog(
     private fun runWatchdogLoop() {
         val hangThreshold = TimeUnit.MILLISECONDS.toNanos(listener.hangThresholdMillis)
         val stuckThreshold = TimeUnit.MILLISECONDS.toNanos(listener.stuckThresholdMillis)
-        val watchdogTaskExecuted = AtomicBoolean(true)
-        var stuckSubmission = time()
-        var stuckDeadline = stuckSubmission + stuckThreshold
-        while (!executorService.isTerminated && !isReleased) {
-            if (watchdogTaskExecuted.compareAndSet(true, false)) {
-                stuckSubmission = time()
-                stuckDeadline = stuckSubmission + stuckThreshold
-                submit { watchdogTaskExecuted.set(true) }
-            } else if (time() > stuckDeadline) {
-                stuckDeadline = Long.MAX_VALUE
-                listener.onStuck(activeTasks)
-            }
+        val stuckHelper = StuckHelper(stuckThreshold)
+        outer@while (!isTerminated && !isReleased) {
+            stuckHelper.check()
             lock.withLock {
                 var timeToWait = minOf(hangThreshold, stuckThreshold)
                 val endTime = time() + hangThreshold
-                while (time() < endTime) {
+                val hasTasks = tasks.isNotEmpty()
+                while (hasTasks && time() < endTime) {
                     try {
-                        condition.awaitNanos(timeToWait)
-                        if (time() > stuckDeadline && !watchdogTaskExecuted.get()) {
-                            stuckDeadline = Long.MAX_VALUE
-                            listener.onStuck(activeTasks)
+                        val estimated = condition.awaitNanos(timeToWait)
+                        if (estimated > 0) {
+                            break
+                        } else {
+                            val time = time()
+                            val overdue = time - endTime
+                            val tasksAtAwake = tasks.valuesList()
+                            if (overdue > 0 && tasksAtAwake.isNotEmpty() && !isReleased) {
+                                tasks.valuesList()
+                                    .mapNotNull { task -> task.takeIf { it.getExecutionTimeNs(time) > hangThreshold } }
+                                    .takeIf { it.isNotEmpty() }
+                                    ?.let {
+                                        listener.onHang(it)
+                                    }
+                            }
+                            stuckHelper.check()
                         }
                     } catch (_: InterruptedException) {
                         timeToWait = endTime - time() - 1
                     }
                 }
-                if (!tasks.isEmpty() && !isReleased) {
-                    listener.onHang(tasks.valuesList())
-                }
             }
         }
     }
+
+
+    /**
+     * Default implementation of Iterable<T>.toList() with ConcurrentHashMap::values
+     * is not applicable in concurrent access and leads to crash.
+     * https://youtrack.jetbrains.com/issue/KT-30185
+     */
+    private fun <V> ConcurrentHashMap<*, V>.valuesList(): List<V> {
+        val v = values
+        return when (size) {
+            0 -> emptyList()
+            1 -> {
+                val iter = v.iterator()
+                if(iter.hasNext()) listOf(iter.next()) else emptyList()
+            }
+            else -> ArrayList(v)
+        }
+    }
+
 
     protected class WrappedRunnable<V>(
         val origin: Runnable,
@@ -216,20 +238,25 @@ open class ExecutorServiceWatchdog(
         }
     }
 
-    /**
-     * Default implementation of Iterable<T>.toList() with ConcurrentHashMap::values
-     * is not applicable in concurrent access and leads to crash.
-     * https://youtrack.jetbrains.com/issue/KT-30185
-     */
-    private fun <V> ConcurrentHashMap<*, V>.valuesList(): List<V> {
-        val v = values
-        return when (size) {
-            0 -> emptyList()
-            1 -> {
-                val iter = v.iterator()
-                if(iter.hasNext()) listOf(iter.next()) else emptyList()
+    private inner class StuckHelper(private val stuckThreshold: Long) {
+        private val watchdogTaskExecuted = AtomicBoolean(true)
+        private var stuckSubmission = time()
+        private var stuckDeadline = stuckSubmission + stuckThreshold
+
+        fun check() {
+            if (!isTerminated && !isShutdown) {
+                if (watchdogTaskExecuted.compareAndSet(true, false)) {
+                    stuckSubmission = time()
+                    stuckDeadline = stuckSubmission + stuckThreshold
+                    try {
+                        execute { watchdogTaskExecuted.set(true) }
+                    } catch (_: RejectedExecutionException) {
+                    }
+                } else if (time() > stuckDeadline) {
+                    stuckDeadline = Long.MAX_VALUE
+                    listener.onStuck(activeTasks)
+                }
             }
-            else -> ArrayList(v)
         }
     }
 

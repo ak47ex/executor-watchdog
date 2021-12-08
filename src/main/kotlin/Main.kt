@@ -4,17 +4,18 @@ import kotlin.concurrent.thread
 import kotlin.random.Random
 
 fun main(args: Array<String>) {
-    println("Hello World!")
+    log("Hello World!")
 
     val executor = Executors.newSingleThreadExecutor().withWatchdog(
         stuckThresholdMillis = 5000L,
         hangThresholdMillis = 1000L,
         onHang = {
-            println("hang!")
+            log("hang!")
+        },
+        onStuck = {
+            log("stuck!")
         }
-    ) {
-        println("stuck!")
-    }
+    )
 
     test(executor)
 
@@ -26,10 +27,10 @@ fun main(args: Array<String>) {
 }
 
 private fun test(executorService: ExecutorService) {
-    val threads = 5
-    val tasksPerThread = 1
-    val minJobDuration = 1_000L
-    val maxJobDuration = 10_000L
+    val threads = 8
+    val tasksPerThread = 20
+    val minJobDuration = 500L
+    val maxJobDuration = 10000L
 
     val startLatch = CountDownLatch(threads)
     val threadDeadLatch = CountDownLatch(threads)
@@ -40,7 +41,9 @@ private fun test(executorService: ExecutorService) {
             startLatch.await()
             repeat(tasksPerThread) {
                 executorService.submit {
-                    Thread.sleep(Random.nextLong(minJobDuration, maxJobDuration))
+                    val sleep = Random.nextLong(minJobDuration, maxJobDuration)
+                    log("sleep for $sleep")
+                    Thread.sleep(sleep)
                     jobLatch.countDown()
                 }
             }
@@ -48,7 +51,11 @@ private fun test(executorService: ExecutorService) {
         }
     }
     threadDeadLatch.await()
-    println("everything submitted!")
+    log("everything submitted!")
     jobLatch.await()
-    println("everything completed!")
+    log("everything completed!")
+}
+
+private fun log(text: String) {
+    println(text)
 }
