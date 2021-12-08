@@ -1,16 +1,18 @@
 package com.suenara.executorservicewatchdog
 
+import java.util.concurrent.TimeUnit
+
 @Suppress("ArrayInDataClass")
 data class WatchdogTask(
     val submitThread: String,
     private val submitTime: Long,
     private val startTime: Long = submitTime,
-    val stacktrace: Array<StackTraceElement>,
+    val stacktrace: Collection<StackTraceElement>,
 ) {
-    fun getExecutionTime(currentTimeNanos: Long) = currentTimeNanos - startTime
+    fun getExecutionTimeNs(currentTimeNanos: Long) = currentTimeNanos - startTime
 
     fun toString(currentTimeNanos: Long): String {
-        return "WatchdogTask(\n    submitThread='$submitThread',\n    executionTime=${getExecutionTime(currentTimeNanos)},\n    stacktrace=\n${stacktrace.drop(1).joinToString("\n    ")}\n)"
+        return "WatchdogTask(\n    submitThread='$submitThread',\n    executionTime=${TimeUnit.NANOSECONDS.toMillis(getExecutionTimeNs(currentTimeNanos))}ms,\n    stacktrace=\n    ${stacktrace.joinToString("\n    ")}\n)"
     }
 
 }

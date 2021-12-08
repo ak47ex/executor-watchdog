@@ -1,25 +1,54 @@
-import com.suenara.executorservicewatchdog.ExecutorServiceWatchdog
-import com.suenara.executorservicewatchdog.ScheduledExecutorServiceWatchdog
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
+import com.suenara.executorservicewatchdog.withWatchdog
+import java.util.concurrent.*
+import kotlin.concurrent.thread
+import kotlin.random.Random
 
 fun main(args: Array<String>) {
     println("Hello World!")
 
-    val executor = ScheduledExecutorServiceWatchdog(Executors.newSingleThreadScheduledExecutor())
-    executor.hangListener = { tasks ->
-        val time = System.nanoTime()
-        println("hanging:\n${tasks.joinToString("\n") { it.toString(time) }}")
-    }
-    executor.schedule({
-        var i = 5
-        while (i-- > 0) {
-            Thread.sleep(10_000)
+    val executor = Executors.newSingleThreadExecutor().withWatchdog(
+        stuckThresholdMillis = 5000L,
+        hangThresholdMillis = 1000L,
+        onHang = {
+            println("hang!")
         }
-    }, 15, TimeUnit.SECONDS)
+    ) {
+        println("stuck!")
+    }
+
+    test(executor)
+
     while (readLine().orEmpty().isBlank()){
     }
-    executor.release()
+    executor.shutdown()
     while (readLine().orEmpty().isBlank()){
     }
+}
+
+private fun test(executorService: ExecutorService) {
+    val threads = 5
+    val tasksPerThread = 1
+    val minJobDuration = 1_000L
+    val maxJobDuration = 10_000L
+
+    val startLatch = CountDownLatch(threads)
+    val threadDeadLatch = CountDownLatch(threads)
+    val jobLatch = CountDownLatch(tasksPerThread * threads)
+    repeat(threads) {
+        thread(name = "thread-num-${it + 1}") {
+            startLatch.countDown()
+            startLatch.await()
+            repeat(tasksPerThread) {
+                executorService.submit {
+                    Thread.sleep(Random.nextLong(minJobDuration, maxJobDuration))
+                    jobLatch.countDown()
+                }
+            }
+            threadDeadLatch.countDown()
+        }
+    }
+    threadDeadLatch.await()
+    println("everything submitted!")
+    jobLatch.await()
+    println("everything completed!")
 }

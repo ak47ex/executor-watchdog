@@ -1,3 +1,5 @@
+@file:Suppress("MemberVisibilityCanBePrivate")
+
 package com.suenara.executorservicewatchdog
 
 import java.util.concurrent.*
@@ -9,13 +11,12 @@ import kotlin.concurrent.withLock
 
 open class ExecutorServiceWatchdog(
     private val executorService: ExecutorService,
-    private val hangThresholdMillis: Long = 5_000L,
+    private val listener: WatchdogListener,
     watchdogThreadProvider: (Runnable) -> Unit = DEFAULT_THREAD_PROVIDER
 ) : ExecutorService {
 
-    var hangListener: ((Collection<WatchdogTask>) -> Unit)? = null
     val activeTasks: Collection<WatchdogTask>
-        get() = tasks.values.toList()
+        get() = tasks.valuesList()
 
     @Volatile
     private var isReleased = false
@@ -27,26 +28,7 @@ open class ExecutorServiceWatchdog(
 
     init {
         watchdogThreadProvider {
-            val watchdogTaskExecuted = AtomicBoolean(true)
-            while (!executorService.isTerminated && !isReleased) {
-                if (watchdogTaskExecuted.compareAndSet(true, false)) {
-                    execute { watchdogTaskExecuted.set(true) }
-                }
-                lock.withLock {
-                    var timeToWait = TimeUnit.MILLISECONDS.toNanos(hangThresholdMillis)
-                    val endTime = time() + timeToWait
-                    while (time() < endTime) {
-                        try {
-                            condition.awaitNanos(timeToWait)
-                        } catch (_: InterruptedException) {
-                            timeToWait = endTime - time() - 1
-                        }
-                    }
-                    if (!tasks.isEmpty() && !isReleased) {
-                        hangListener?.invoke(tasks.values.toList())
-                    }
-                }
-            }
+            runWatchdogLoop()
         }
     }
 
@@ -58,8 +40,8 @@ open class ExecutorServiceWatchdog(
     }
 
     override fun execute(command: Runnable) {
-        val num = rememberTask()
-        executorService.execute(wrap(command, num))
+        val wdTask = createTask()
+        executorService.execute(wrap(command, wdTask))
     }
 
     override fun shutdown() {
@@ -87,24 +69,24 @@ open class ExecutorServiceWatchdog(
     }
 
     override fun <T : Any?> submit(task: Callable<T>): Future<T> {
-        val num = rememberTask()
-        return executorService.submit(wrap(task, num))
+        val wdTask = createTask()
+        return executorService.submit(wrap(task, wdTask))
     }
 
     override fun <T : Any?> submit(task: Runnable, result: T): Future<T> {
-        val num = rememberTask()
-        return executorService.submit(wrap(task, num), result)
+        val wdTask = createTask()
+        return executorService.submit(wrap(task, wdTask), result)
     }
 
     override fun submit(task: Runnable): Future<*> {
-        val num = rememberTask()
-        return executorService.submit(wrap(task, num))
+        val wdTask = createTask()
+        return executorService.submit(wrap(task, wdTask))
     }
 
     override fun <T : Any?> invokeAll(tasks: MutableCollection<out Callable<T>>): MutableList<Future<T>> {
         val remeberedTasks = tasks.map {
-            val num = rememberTask()
-            wrap(it, num)
+            val wdTask = createTask()
+            wrap(it, wdTask)
         }
         return executorService.invokeAll(remeberedTasks)
     }
@@ -115,24 +97,24 @@ open class ExecutorServiceWatchdog(
         unit: TimeUnit
     ): MutableList<Future<T>> {
         val remeberedTasks = tasks.map {
-            val num = rememberTask()
-            wrap(it, num)
+            val wdTask = createTask()
+            wrap(it, wdTask)
         }
         return executorService.invokeAll(remeberedTasks, timeout, unit)
     }
 
     override fun <T : Any?> invokeAny(tasks: MutableCollection<out Callable<T>>): T {
         val remeberedTasks = tasks.map {
-            val num = rememberTask()
-            wrap(it, num)
+            val wdTask = createTask()
+            wrap(it, wdTask)
         }
         return executorService.invokeAny(remeberedTasks)
     }
 
     override fun <T : Any?> invokeAny(tasks: MutableCollection<out Callable<T>>, timeout: Long, unit: TimeUnit): T {
         val remeberedTasks = tasks.map {
-            val num = rememberTask()
-            wrap(it, num)
+            val wdTask = createTask()
+            wrap(it, wdTask)
         }
         return executorService.invokeAny(remeberedTasks, timeout, unit)
     }
@@ -144,7 +126,16 @@ open class ExecutorServiceWatchdog(
     }
 
     protected fun createTask(): WatchdogTask = Thread.currentThread().run {
-        WatchdogTask(submitThread = name, submitTime = time(), stacktrace = stackTrace)
+        WatchdogTask(
+            submitThread = name,
+            submitTime = time(),
+            stacktrace = stackTrace
+                .asSequence()
+                .filterNot { it.className.startsWith(Thread::class.java.name) }
+                .filterNot { it.className.startsWith(ExecutorServiceWatchdog::class.java.name) }
+                .filterNot { it.className.startsWith(this@ExecutorServiceWatchdog.javaClass.name) }
+                .toList()
+        )
     }
 
     protected fun completeTask(task: Long) {
@@ -154,16 +145,51 @@ open class ExecutorServiceWatchdog(
         }
     }
 
-    private fun wrap(runnable: Runnable, taskToRemove: Long): WrappedRunnable<Long> = WrappedRunnable(runnable) {
-        completeTask(taskToRemove)
+    protected fun wrap(runnable: Runnable, task: WatchdogTask): Runnable {
+        return WrappedRunnable(runnable, { rememberTask(task) }, { it?.let(::completeTask) })
     }
 
-    private fun <T> wrap(callable: Callable<T>, taskToRemove: Long): WrappedCallable<T, Long> =
-        WrappedCallable(callable) {
-            completeTask(taskToRemove)
-        }
+    protected fun <V> wrap(callable: Callable<V>, task: WatchdogTask): Callable<V> {
+        return WrappedCallable(callable, { rememberTask(task) }, { it?.let(::completeTask) })
+    }
 
     private fun time(): Long = System.nanoTime()
+
+    private fun runWatchdogLoop() {
+        val hangThreshold = TimeUnit.MILLISECONDS.toNanos(listener.hangThresholdMillis)
+        val stuckThreshold = TimeUnit.MILLISECONDS.toNanos(listener.stuckThresholdMillis)
+        val watchdogTaskExecuted = AtomicBoolean(true)
+        var stuckSubmission = time()
+        var stuckDeadline = stuckSubmission + stuckThreshold
+        while (!executorService.isTerminated && !isReleased) {
+            if (watchdogTaskExecuted.compareAndSet(true, false)) {
+                stuckSubmission = time()
+                stuckDeadline = stuckSubmission + stuckThreshold
+                submit { watchdogTaskExecuted.set(true) }
+            } else if (time() > stuckDeadline) {
+                stuckDeadline = Long.MAX_VALUE
+                listener.onStuck(activeTasks)
+            }
+            lock.withLock {
+                var timeToWait = minOf(hangThreshold, stuckThreshold)
+                val endTime = time() + hangThreshold
+                while (time() < endTime) {
+                    try {
+                        condition.awaitNanos(timeToWait)
+                        if (time() > stuckDeadline && !watchdogTaskExecuted.get()) {
+                            stuckDeadline = Long.MAX_VALUE
+                            listener.onStuck(activeTasks)
+                        }
+                    } catch (_: InterruptedException) {
+                        timeToWait = endTime - time() - 1
+                    }
+                }
+                if (!tasks.isEmpty() && !isReleased) {
+                    listener.onHang(tasks.valuesList())
+                }
+            }
+        }
+    }
 
     protected class WrappedRunnable<V>(
         val origin: Runnable,
@@ -187,6 +213,23 @@ open class ExecutorServiceWatchdog(
             val result = origin.call()
             afterRun?.invoke(before)
             return result
+        }
+    }
+
+    /**
+     * Default implementation of Iterable<T>.toList() with ConcurrentHashMap::values
+     * is not applicable in concurrent access and leads to crash.
+     * https://youtrack.jetbrains.com/issue/KT-30185
+     */
+    private fun <V> ConcurrentHashMap<*, V>.valuesList(): List<V> {
+        val v = values
+        return when (size) {
+            0 -> emptyList()
+            1 -> {
+                val iter = v.iterator()
+                if(iter.hasNext()) listOf(iter.next()) else emptyList()
+            }
+            else -> ArrayList(v)
         }
     }
 

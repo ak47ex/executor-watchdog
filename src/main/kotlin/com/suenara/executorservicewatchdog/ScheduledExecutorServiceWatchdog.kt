@@ -4,9 +4,9 @@ import java.util.concurrent.*
 
 class ScheduledExecutorServiceWatchdog(
     private val executorService: ScheduledExecutorService,
-    hangThresholdMillis: Long = 5_000L,
+    watchdogListener: WatchdogListener,
     watchdogThreadProvider: (Runnable) -> Unit = DEFAULT_THREAD_PROVIDER
-) : ExecutorServiceWatchdog(executorService, hangThresholdMillis, watchdogThreadProvider), ScheduledExecutorService {
+) : ExecutorServiceWatchdog(executorService, watchdogListener, watchdogThreadProvider), ScheduledExecutorService {
 
     override fun schedule(command: Runnable, delay: Long, unit: TimeUnit): ScheduledFuture<*> {
         val task = createTask()
@@ -36,13 +36,5 @@ class ScheduledExecutorServiceWatchdog(
     ): ScheduledFuture<*> {
         val task = createTask()
         return executorService.scheduleAtFixedRate(wrap(command, task), initialDelay, delay, unit)
-    }
-
-    private fun wrap(runnable: Runnable, task: WatchdogTask): Runnable {
-        return WrappedRunnable(runnable, { rememberTask(task) }, { it?.let(::completeTask) })
-    }
-
-    private fun <V> wrap(callable: Callable<V>, task: WatchdogTask): Callable<V> {
-        return WrappedCallable(callable, { rememberTask(task) }, { it?.let(::completeTask) })
     }
 }
