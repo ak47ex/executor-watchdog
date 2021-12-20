@@ -12,7 +12,8 @@ import kotlin.concurrent.withLock
 open class ExecutorServiceWatchdog(
     private val executorService: ExecutorService,
     private val listener: WatchdogListener,
-    watchdogThreadProvider: (Runnable) -> Unit = DEFAULT_THREAD_PROVIDER
+    watchdogThreadProvider: (Runnable) -> Unit = DEFAULT_THREAD_PROVIDER,
+    private val timeNanosProvider: () -> Long = { System.nanoTime() }
 ) : ExecutorService {
 
     val activeTasks: Collection<WatchdogTask>
@@ -155,7 +156,7 @@ open class ExecutorServiceWatchdog(
         return WrappedCallable(callable, { rememberTask(task) }, { it?.let(::completeTask) })
     }
 
-    private fun time(): Long = System.nanoTime()
+    private fun time(): Long = timeNanosProvider()
 
     private fun runWatchdogLoop() {
         val hangThreshold = TimeUnit.MILLISECONDS.toNanos(listener.hangThresholdMillis)
@@ -171,7 +172,7 @@ open class ExecutorServiceWatchdog(
                     try {
                         val estimated = condition.awaitNanos(timeToWait)
                         if (estimated > 0) {
-                            break
+                            continue
                         } else {
                             val time = time()
                             val overdue = time - endTime
